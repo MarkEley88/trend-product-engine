@@ -8,16 +8,16 @@ const categories = [
 ];
 
 function clean(value = '') {
-  return value.replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
+  return value.replace(/<!\\[CDATA\\[/g, '').replace(/\\]\\]>/g, '').replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\\s+/g, ' ').trim();
 }
 
 function rssItems(xml, limit = 12) {
   const items = [];
-  const matches = xml.match(/<item[\s\S]*?<\/item>/gi) || [];
+  const matches = xml.match(/<item[\\s\\S]*?<\\/item>/gi) || [];
   for (const block of matches.slice(0, limit)) {
-    const title = clean((block.match(/<title>([\s\S]*?)<\/title>/i) || [,''])[1]);
-    const link = clean((block.match(/<link>([\s\S]*?)<\/link>/i) || [,''])[1]);
-    const pubDate = clean((block.match(/<pubDate>([\s\S]*?)<\/pubDate>/i) || [,''])[1]);
+    const title = clean((block.match(/<title>([\\s\\S]*?)<\\/title>/i) || [,''])[1]);
+    const link = clean((block.match(/<link>([\\s\\S]*?)<\\/link>/i) || [,''])[1]);
+    const pubDate = clean((block.match(/<pubDate>([\\s\\S]*?)<\\/pubDate>/i) || [,''])[1]);
     if (title) items.push({ title, link, pubDate });
   }
   return items;
