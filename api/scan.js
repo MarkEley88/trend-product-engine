@@ -8,7 +8,7 @@ const categories = [
 ];
 
 function clean(value = '') {
-  return value.replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
+  return String(value).replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
 }
 
 function rssItems(xml, limit = 12) {
@@ -63,6 +63,68 @@ async function youtubeSearch(query) {
   }
 }
 
+function toArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value == null || value === '') return [];
+  return [value];
+}
+
+function text(value, fallback = '') {
+  if (typeof value === 'string') return value.trim() || fallback;
+  if (typeof value === 'number') return String(value);
+  if (typeof value === 'boolean') return value ? 'Yes' : 'No';
+  if (value && typeof value === 'object') {
+    if (typeof value.detail === 'string') return value.detail;
+    if (typeof value.text === 'string') return value.text;
+    return JSON.stringify(value);
+  }
+  return fallback;
+}
+
+function normalizeEvidence(value, defaultSource = 'AI analysis') {
+  return toArray(value).map(item => {
+    if (typeof item === 'string') return { source: defaultSource, detail: item };
+    return { source: text(item?.source, defaultSource), detail: text(item?.detail || item?.text, text(item)) };
+  }).filter(x => x.detail);
+}
+
+function normalizeSources(value) {
+  return toArray(value).map(item => {
+    if (typeof item === 'string') return item;
+    return item?.url || item?.link || '';
+  }).filter(url => /^https?:\/\//i.test(url)).slice(0, 4);
+}
+
+function normalizeOpportunity(item, index) {
+  const allowedScores = new Set(['High potential', 'Medium-high', 'Medium', 'Needs evidence']);
+  const evidence = normalizeEvidence(item?.evidence);
+  const complaints = normalizeEvidence(item?.complaintsEvidence);
+  const gap = text(item?.gap, 'More product-review/comment evidence needed');
+  const unprovenRaw = item?.unproven;
+  const unproven = typeof unprovenRaw === 'boolean'
+    ? (unprovenRaw ? 'This remains unproven and needs further investigation.' : 'No specific unresolved uncertainty was returned.')
+    : text(unprovenRaw, 'The strongest customer complaint, willingness to pay and product gap still need validation.');
+
+  return {
+    category: text(item?.category, 'Uncategorised'),
+    title: text(item?.title, `Potential opportunity ${index + 1}`),
+    problem: text(item?.problem, 'A specific human problem needs further definition.'),
+    trend: text(item?.trend, 'Signal identified in the supplied research.'),
+    score: allowedScores.has(item?.score) ? item.score : 'Needs evidence',
+    confidence: Math.max(1, Math.min(10, Number.parseInt(item?.confidence, 10) || 1)),
+    evidence: evidence.slice(0, 5),
+    products: text(item?.products, 'No sufficiently specific existing products were identified in the supplied evidence.'),
+    complaintsEvidence: complaints.slice(0, 4),
+    gap,
+    unproven,
+    audience: text(item?.audience, 'Audience needs further investigation.'),
+    ads: text(item?.ads, 'Advertising channels need further investigation.'),
+    sell: text(item?.sell, 'Sales channels need further investigation.'),
+    next: text(item?.next, 'Collect product-review and customer-comment evidence before making a product decision.'),
+    sources: normalizeSources(item?.sources)
+  };
+}
+
 module.exports = async (req, res) => {
   if (req.method !== 'GET') return res.status(405).json({ message: 'GET only' });
   if (!process.env.OPENAI_API_KEY) return res.status(200).json({ message: 'OPENAI_API_KEY is not available to this deployment. Add it to the Production environment and redeploy.', opportunities: [], sources: [] });
@@ -89,24 +151,26 @@ module.exports = async (req, res) => {
     const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
     const prompt = `You are an evidence-led commercial product opportunity discovery analyst. Analyse the supplied live public-web signals and find 8-12 potential product opportunities across Automotive, Home & DIY, Pets and Travel.
 
-IMPORTANT: Do NOT turn a broad trend directly into a generic business idea. The chain must be: SIGNAL -> SPECIFIC HUMAN PROBLEM -> EXISTING PRODUCTS -> VERIFIED/OBSERVED CUSTOMER COMPLAINTS OR GAP -> POTENTIAL PRODUCT OPPORTUNITY -> TEST.
+The current data sources are Google Trends and Google News, plus YouTube only if a YouTube API key is configured. IMPORTANT: these sources do NOT contain product reviews or customer comments. Therefore you MUST NOT claim that a customer complaint has been verified unless it is explicitly present in the supplied data.
+
+Required chain: SIGNAL -> SPECIFIC HUMAN PROBLEM -> EXISTING PRODUCTS -> VERIFIED/OBSERVED CUSTOMER COMPLAINTS OR GAP -> POTENTIAL PRODUCT OPPORTUNITY -> TEST.
 
 Rules:
 - Start each opportunity with a specific human problem, not a product category.
 - Only state a demand signal when the supplied data supports it. Name the signal/source in evidence.
 - Never invent search volumes, growth percentages, product names, prices, review counts, customer complaints or market facts.
-- Existing products should be actual products/product types supported by the supplied evidence where possible. If the supplied data is insufficient, say so rather than inventing brands.
-- Customer gaps must be evidence-backed. If complaints/gaps are NOT present in the supplied data, set complaintsEvidence to an empty array and say "More product-review/comment evidence needed" in gap and unproven.
-- Separate observed evidence from AI interpretation. Do not present interpretation as fact.
+- Existing products may be described only as product types supported by the supplied data. Do not invent brands or product specifications.
+- Because this scan has no review/comment source, complaintsEvidence MUST be an empty array for every opportunity.
+- Because customer complaints are not available, gap MUST describe the evidence gap rather than inventing a product gap.
+- Keep observed evidence separate from AI interpretation.
 - A potential opportunity is not guaranteed demand.
-- Do not use the old generic claim "limited options" unless the supplied evidence actually demonstrates it.
-- Prefer narrow, high-intent consumer problems with an identifiable reason someone might pay to solve them.
-- Score is directional, based ONLY on strength and breadth of supplied evidence, not a prediction. Use one of "High potential", "Medium-high", "Medium", "Needs evidence".
-- confidence is an integer from 1-10 representing confidence in the evidence supporting the opportunity, NOT likelihood of success.
-- evidence should be an array of 2-5 short factual observations. Each observation must have source and detail fields.
-- complaintsEvidence should be an array of 0-4 short factual observations, each with source and detail. Never fabricate these.
-- sources should contain up to 4 exact URLs from supplied data only.
-- Return ONLY valid JSON with key opportunities. Each opportunity must have exactly these keys: category,title,problem,trend,score,confidence,evidence,products,complaintsEvidence,gap,unproven,audience,ads,sell,next,sources.
+- Score is directional and based only on breadth/strength of the supplied evidence, not commercial success probability.
+- Use one of: High potential, Medium-high, Medium, Needs evidence.
+- confidence is 1-10 and measures evidence strength, not likelihood of success.
+- evidence must contain 2-5 factual observations with source and detail.
+- sources must contain exact URLs from supplied data only.
+- Return ONLY valid JSON with key opportunities.
+- Each opportunity must have exactly: category,title,problem,trend,score,confidence,evidence,products,complaintsEvidence,gap,unproven,audience,ads,sell,next,sources.
 
 Data: ${compact}`;
 
@@ -115,7 +179,7 @@ Data: ${compact}`;
       temperature: 0.1,
       response_format: { type: 'json_object' },
       messages: [
-        { role: 'system', content: 'Return evidence-led structured commercial research. Never fabricate sources, prices, demand or customer complaints.' },
+        { role: 'system', content: 'Return structured evidence-led commercial research. Never fabricate sources, prices, demand, products or customer complaints.' },
         { role: 'user', content: prompt }
       ]
     });
@@ -124,7 +188,19 @@ Data: ${compact}`;
     const content = response.choices?.[0]?.message?.content;
     if (!content) throw new Error('OpenAI returned an empty response');
     const parsed = JSON.parse(content);
-    return res.status(200).json({ ...parsed, scannedAt: new Date().toISOString(), sourceCoverage: { googleTrends: trendItems.length, googleNews: sourceResults.reduce((n, x) => n + x.news.length, 0), youtube: sourceResults.reduce((n, x) => n + x.youtube.length, 0), youtubeEnabled: Boolean(process.env.YOUTUBE_API_KEY), model } });
+    const opportunities = toArray(parsed?.opportunities).map(normalizeOpportunity).filter(x => x.title);
+
+    return res.status(200).json({
+      opportunities,
+      scannedAt: new Date().toISOString(),
+      sourceCoverage: {
+        googleTrends: trendItems.length,
+        googleNews: sourceResults.reduce((n, x) => n + x.news.length, 0),
+        youtube: sourceResults.reduce((n, x) => n + x.youtube.length, 0),
+        youtubeEnabled: Boolean(process.env.YOUTUBE_API_KEY),
+        model
+      }
+    });
   } catch (error) {
     console.error(`Live scan failed at ${stage}:`, error);
     const detail = error?.status === 401 ? 'OpenAI rejected the API key.' : error?.status === 429 ? 'OpenAI rate limit or billing limit reached.' : error?.message || 'Unknown error';
