@@ -1,0 +1,11 @@
+{
+  "name": "trend-product-engine",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "dependencies": {
+    "openai": "^5.12.2"
+  }
+}
