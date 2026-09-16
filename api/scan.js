@@ -1,8 +1,12 @@
 const OpenAI = require('openai');
 
-function clean(value = '') { return String(value).replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim(); }
+function clean(value = '') {
+  return String(value).replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
+}
+
 function rssItems(xml, limit = 25) {
-  const items = []; const matches = xml.match(/<item[\s\S]*?<\/item>/gi) || [];
+  const items = [];
+  const matches = xml.match(/<item[\s\S]*?<\/item>/gi) || [];
   for (const block of matches.slice(0, limit)) {
     const title = clean((block.match(/<title>([\s\S]*?)<\/title>/i) || [,''])[1]);
     const link = clean((block.match(/<link>([\s\S]*?)<\/link>/i) || [,''])[1]);
@@ -11,15 +15,33 @@ function rssItems(xml, limit = 25) {
   }
   return items;
 }
-async function fetchText(url, headers = {}) { const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TrendProductEngine/1.0)', ...headers } }); if (!response.ok) throw new Error(`Source returned ${response.status}`); return response.text(); }
+
+async function fetchText(url, headers = {}) {
+  const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TrendProductEngine/1.0)', ...headers } });
+  if (!response.ok) throw new Error(`Source returned ${response.status}`);
+  return response.text();
+}
+
 async function googleTrends() {
-  try { return rssItems(await fetchText('https://trends.google.com/trending/rss?geo=GB'), 25).map(x => ({ ...x, source: 'Google Trends', signalType: 'trending search' })); }
-  catch (e) { console.error('Google Trends failed:', e.message); return []; }
+  try {
+    return rssItems(await fetchText('https://trends.google.com/trending/rss?geo=GB'), 25)
+      .map(x => ({ ...x, source: 'Google Trends', signalType: 'trending search' }));
+  } catch (e) {
+    console.error('Google Trends failed:', e.message);
+    return [];
+  }
 }
+
 async function googleNews(query, limit = 10, signalType = 'context') {
-  try { const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-GB&gl=GB&ceid=GB:en`; return rssItems(await fetchText(url), limit).map(x => ({ ...x, source: 'Google News', signalType })); }
-  catch (e) { console.error('Google News failed:', e.message); return []; }
+  try {
+    const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-GB&gl=GB&ceid=GB:en`;
+    return rssItems(await fetchText(url), limit).map(x => ({ ...x, source: 'Google News', signalType }));
+  } catch (e) {
+    console.error('Google News failed:', e.message);
+    return [];
+  }
 }
+
 async function redditSearch(query) {
   const urls = [
     `https://www.reddit.com/search.json?q=${encodeURIComponent(query)}&sort=relevance&limit=15`,
@@ -39,16 +61,50 @@ async function redditSearch(query) {
         const rows = rssItems(await response.text(), 15).map(x => ({ ...x, source: 'Reddit', signalType: 'customer discussion' }));
         if (rows.length) return rows;
       }
-    } catch (e) { console.error('Reddit failed:', e.message); }
+    } catch (e) {
+      console.error('Reddit failed:', e.message);
+    }
   }
   return [];
 }
 
-// Public YouTube search is used only to discover the actual content themes.
-// No predefined product categories or problem queries are supplied.
-async function youtubeWebSearch() {
+// Broad search-intent discovery. These are query shapes, not product categories.
+// The engine asks public autocomplete services what people commonly complete them into.
+async function autocompleteSuggestions(prefix) {
+  const urls = [
+    `https://suggestqueries.google.com/complete/search?client=firefox&hl=en-GB&q=${encodeURIComponent(prefix)}`,
+    `https://www.google.com/complete/search?client=firefox&hl=en-GB&q=${encodeURIComponent(prefix)}`
+  ];
+  for (const url of urls) {
+    try {
+      const raw = await fetchText(url, { 'Accept': 'application/json,text/plain,*/*', 'Accept-Language': 'en-GB,en;q=0.9' });
+      const data = JSON.parse(raw);
+      const suggestions = Array.isArray(data?.[1]) ? data[1].map(x => typeof x === 'string' ? x : x?.[0]).filter(Boolean) : [];
+      if (suggestions.length) return suggestions;
+    } catch (e) {
+      console.error('Autocomplete failed:', e.message);
+    }
+  }
+  return [];
+}
+
+async function searchIntentDiscovery() {
+  const prefixes = [
+    'how to', 'how do I', 'how can I', 'how do you', 'help with',
+    'alternative to', 'replacement for', 'best way to', 'problem with',
+    'why does', 'is there a way to', 'what can I use instead of'
+  ];
+  const results = [];
+  for (const prefix of prefixes) {
+    const suggestions = await autocompleteSuggestions(prefix);
+    suggestions.slice(0, 10).forEach(query => results.push({ query, prefix, source: 'Google Autocomplete', signalType: 'search-intent' }));
+  }
+  return Array.from(new Map(results.map(x => [x.query.toLowerCase(), x])).values()).slice(0, 100);
+}
+
+async function youtubeSearch(query, limit = 20) {
   try {
-    const url = 'https://www.youtube.com/results?search_query=how%20to';
+    const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
     const html = await fetchText(url, { 'Accept-Language': 'en-GB,en;q=0.9' });
     const marker = 'var ytInitialData = ';
     const start = html.indexOf(marker);
@@ -59,98 +115,158 @@ async function youtubeWebSearch() {
     const data = JSON.parse(raw.trim().replace(/;$/, ''));
     const results = [];
     function walk(node) {
-      if (!node || results.length >= 60) return;
+      if (!node || results.length >= limit) return;
       if (Array.isArray(node)) { for (const item of node) walk(item); return; }
       if (typeof node !== 'object') return;
       const renderer = node.videoRenderer;
       if (renderer?.videoId && renderer?.title?.runs?.length) {
         const title = renderer.title.runs.map(r => r.text || '').join('').trim();
-        const channel = renderer.ownerText?.runs?.map(r => r.text || '').join('').trim() || '';
-        const published = renderer.publishedTimeText?.simpleText || '';
-        const views = renderer.viewCountText?.simpleText || '';
-        if (title) results.push({ title, link: `https://www.youtube.com/watch?v=${renderer.videoId}`, channel, published, views, source: 'YouTube', signalType: 'YouTube search result' });
+        if (title) results.push({ title, link: `https://www.youtube.com/watch?v=${renderer.videoId}`, channel: renderer.ownerText?.runs?.map(r => r.text || '').join('').trim() || '', published: renderer.publishedTimeText?.simpleText || '', views: renderer.viewCountText?.simpleText || '', query, source: 'YouTube', signalType: 'content/search signal' });
       }
       for (const value of Object.values(node)) walk(value);
     }
     walk(data);
     return results;
-  } catch (e) { console.error('YouTube web search failed:', e.message); return []; }
+  } catch (e) {
+    console.error(`YouTube search failed for ${query}:`, e.message);
+    return [];
+  }
 }
-function toArray(value) { if (Array.isArray(value)) return value; if (value == null || value === '') return []; return [value]; }
-function text(value, fallback = '') { if (typeof value === 'string') return value.trim() || fallback; if (typeof value === 'number') return String(value); if (typeof value === 'boolean') return value ? 'Yes' : 'No'; if (value && typeof value === 'object') { if (typeof value.detail === 'string') return value.detail; if (typeof value.text === 'string') return value.text; return JSON.stringify(value); } return fallback; }
-function normalizeEvidence(value, defaultSource = 'AI analysis') { return toArray(value).map(item => typeof item === 'string' ? { source: defaultSource, detail: item } : { source: text(item?.source, defaultSource), detail: text(item?.detail || item?.text, text(item)), url: text(item?.url, '') }).filter(x => x.detail); }
-function normalizeSources(value) { return toArray(value).map(item => typeof item === 'string' ? item : item?.url || item?.link || '').filter(url => /^https?:\/\//i.test(url)).slice(0, 10); }
+
+async function youtubeDiscovery(queries) {
+  const selected = queries.slice(0, 24);
+  const all = [];
+  for (const item of selected) {
+    const rows = await youtubeSearch(item.query, 8);
+    all.push(...rows);
+  }
+  return all;
+}
+
+function toArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value == null || value === '') return [];
+  return [value];
+}
+function text(value, fallback = '') {
+  if (typeof value === 'string') return value.trim() || fallback;
+  if (typeof value === 'number') return String(value);
+  if (typeof value === 'boolean') return value ? 'Yes' : 'No';
+  if (value && typeof value === 'object') {
+    if (typeof value.detail === 'string') return value.detail;
+    if (typeof value.text === 'string') return value.text;
+    return JSON.stringify(value);
+  }
+  return fallback;
+}
+function normalizeEvidence(value, defaultSource = 'AI analysis') {
+  return toArray(value).map(item => typeof item === 'string' ? { source: defaultSource, detail: item } : { source: text(item?.source, defaultSource), detail: text(item?.detail || item?.text, text(item)), url: text(item?.url, '') }).filter(x => x.detail);
+}
+function normalizeSources(value) {
+  return toArray(value).map(item => typeof item === 'string' ? item : item?.url || item?.link || '').filter(url => /^https?:\/\//i.test(url)).slice(0, 12);
+}
 function normalizeOpportunity(item, index) {
   const allowedScores = new Set(['High potential', 'Medium-high', 'Medium', 'Needs evidence']);
   const evidence = normalizeEvidence(item?.evidence), complaints = normalizeEvidence(item?.complaintsEvidence);
-  return { category: text(item?.category, 'Emerging theme'), title: text(item?.title, `Potential opportunity ${index + 1}`), problem: text(item?.problem, 'A specific human problem needs further definition.'), trend: text(item?.trend, 'Theme identified from current source signals.'), score: allowedScores.has(item?.score) ? item.score : 'Needs evidence', confidence: Math.max(1, Math.min(10, Number.parseInt(item?.confidence, 10) || 1)), evidence: evidence.slice(0, 6), products: text(item?.products, 'No sufficiently specific existing solutions identified.'), complaintsEvidence: complaints.slice(0, 5), gap: text(item?.gap, 'No verified product gap yet; collect more customer evidence.'), unproven: text(item?.unproven, 'The strongest unresolved complaint, willingness to pay and product gap still need validation.'), audience: text(item?.audience, 'Audience needs further investigation.'), ads: text(item?.ads, 'Advertising channels need further investigation.'), sell: text(item?.sell, 'Sales channels need further investigation.'), next: text(item?.next, 'Collect more evidence before making a product decision.'), sources: normalizeSources(item?.sources) };
+  return {
+    category: text(item?.category, 'Emerging problem'), title: text(item?.title, `Potential opportunity ${index + 1}`), problem: text(item?.problem, 'A specific human problem needs further definition.'), trend: text(item?.trend, 'Search-intent theme identified from current source signals.'), score: allowedScores.has(item?.score) ? item.score : 'Needs evidence', confidence: Math.max(1, Math.min(10, Number.parseInt(item?.confidence, 10) || 1)), evidence: evidence.slice(0, 7), products: text(item?.products, 'No sufficiently specific existing solutions identified.'), complaintsEvidence: complaints.slice(0, 6), gap: text(item?.gap, 'No verified product gap yet; collect more customer evidence.'), unproven: text(item?.unproven, 'Search growth, willingness to pay and the product gap still need validation.'), audience: text(item?.audience, 'Audience needs further investigation.'), ads: text(item?.ads, 'Advertising channels need further investigation.'), sell: text(item?.sell, 'Sales channels need further investigation.'), next: text(item?.next, 'Validate the specific problem and product gap before sourcing.'), sources: normalizeSources(item?.sources)
+  };
 }
+
 module.exports = async (req, res) => {
   if (req.method !== 'GET') return res.status(405).json({ message: 'GET only' });
   if (!process.env.OPENAI_API_KEY) return res.status(200).json({ message: 'OPENAI_API_KEY is not available to this deployment. Add it to the Production environment and redeploy.', opportunities: [], sources: [] });
+
   let stage = 'starting';
   try {
-    stage = 'discovering YouTube how-to themes';
-    const [youtube, trendItems] = await Promise.all([youtubeWebSearch(), googleTrends()]);
-    if (youtube.length < 3) return res.status(200).json({ opportunities: [], scannedAt: new Date().toISOString(), sourceCoverage: { youtube: youtube.length, youtubeEnabled: true, googleTrends: trendItems.length, googleNews: 0, reddit: 0, model: process.env.OPENAI_MODEL || 'gpt-4o-mini' }, message: 'YouTube returned too little discovery data for a reliable theme scan.' });
+    stage = 'discovering broad search intent';
+    const [searchQueries, trendItems] = await Promise.all([searchIntentDiscovery(), googleTrends()]);
+    if (searchQueries.length < 10) return res.status(200).json({ opportunities: [], scannedAt: new Date().toISOString(), sourceCoverage: { searchIntent: searchQueries.length, youtube: 0, youtubeEnabled: true, googleTrends: trendItems.length, googleNews: 0, reddit: 0, model: process.env.OPENAI_MODEL || 'gpt-4o-mini' }, message: 'Search autocomplete returned too little discovery data for a reliable scan.' });
 
-    stage = 'clustering YouTube themes';
+    stage = 'sampling discovered search themes on YouTube';
+    const youtube = await youtubeDiscovery(searchQueries);
+    if (youtube.length < 10) return res.status(200).json({ opportunities: [], scannedAt: new Date().toISOString(), sourceCoverage: { searchIntent: searchQueries.length, youtube: youtube.length, youtubeEnabled: true, googleTrends: trendItems.length, googleNews: 0, reddit: 0, model: process.env.OPENAI_MODEL || 'gpt-4o-mini' }, message: 'The search-intent layer worked, but YouTube returned too little corroborating content.' });
+
+    stage = 'clustering search intent and recurring problems';
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-    const discoveryPrompt = `Analyse ONLY the supplied YouTube search results for the broad query "how to". Do not use predefined categories. Cluster the videos into recurring themes.
+    const discoveryPrompt = `You are the discovery layer of a commercial product research engine. The supplied data comes from broad search-intent autocomplete and YouTube sampling.
 
-A theme must be supported by at least 3 genuinely related videos. Do not treat one viral-looking title as a trend. Prefer repeated tasks, problems or desired outcomes. Ignore entertainment/game walkthroughs, celebrity/news stories, recipes and other subjects where the likely commercial product connection is weak unless multiple videos reveal a concrete physical problem that a product could solve.
+Do NOT use predefined product categories. Discover recurring HUMAN INTENTS from the data itself.
 
-Return only JSON: {"themes":[{"theme":"...","problem":"...","videoEvidence":[{"title":"...","url":"...","views":"...","published":"..."}]}]}. Return at most 8 themes. Use exact URLs from the data. Do not invent metrics.`;
-    const discoveryResponse = await client.chat.completions.create({ model, temperature: 0, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: 'You are a strict trend clustering engine. Never invent evidence.' }, { role: 'user', content: `${discoveryPrompt}\n\nYOUTUBE DATA:\n${JSON.stringify(youtube).slice(0, 65000)}` }] });
-    const themes = toArray(JSON.parse(discoveryResponse.choices?.[0]?.message?.content || '{}')?.themes).filter(t => Array.isArray(t?.videoEvidence) && t.videoEvidence.length >= 3).slice(0, 8);
-    if (!themes.length) return res.status(200).json({ opportunities: [], scannedAt: new Date().toISOString(), sourceCoverage: { youtube: youtube.length, youtubeEnabled: true, googleTrends: trendItems.length, googleNews: 0, reddit: 0, model }, message: 'YouTube content was found, but no recurring how-to theme met the minimum evidence threshold.' });
+Look across these query styles: how to, how do I, how can I, how do you, help with, alternative to, replacement for, best way to, problem with, why does, is there a way to, what can I use instead of.
 
-    stage = 'testing discovered themes for customer problems';
+Identify up to 10 recurring themes where multiple distinct queries/content results point toward the same task, frustration, desired outcome, replacement need or unresolved problem. Prefer concrete physical-world problems that a product could plausibly solve. Reject recipes, game walkthroughs, celebrity/news topics, generic learning, generic app-building and entertainment unless the evidence reveals a separate concrete product problem.
+
+Important: autocomplete presence is evidence of search behaviour, NOT proof of search volume or growth. You must not invent search volume. A theme can only be described as growing later if other supplied evidence supports that.
+
+Return ONLY JSON: {"themes":[{"theme":"...","specificProblem":"...","searchEvidence":[{"query":"...","prefix":"..."}],"youtubeEvidence":[{"title":"...","url":"...","views":"...","published":"..."}]}]}. A theme needs at least 3 related evidence items across the supplied data. Use exact supplied queries and URLs. Never invent metrics.`;
+    const discoveryResponse = await client.chat.completions.create({ model, temperature: 0, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: 'You are a strict search-intent clustering engine. Never invent evidence or metrics.' }, { role: 'user', content: `${discoveryPrompt}\n\nSEARCH INTENT DATA:\n${JSON.stringify(searchQueries).slice(0, 35000)}\n\nYOUTUBE DATA:\n${JSON.stringify(youtube).slice(0, 50000)}\n\nGOOGLE TRENDS DATA:\n${JSON.stringify(trendItems).slice(0, 15000)}` }] });
+    const themes = toArray(JSON.parse(discoveryResponse.choices?.[0]?.message?.content || '{}')?.themes).filter(t => Array.isArray(t?.searchEvidence) && Array.isArray(t?.youtubeEvidence) && (t.searchEvidence.length + t.youtubeEvidence.length) >= 3).slice(0, 10);
+    if (!themes.length) return res.status(200).json({ opportunities: [], scannedAt: new Date().toISOString(), sourceCoverage: { searchIntent: searchQueries.length, youtube: youtube.length, youtubeEnabled: true, googleTrends: trendItems.length, googleNews: 0, reddit: 0, model }, message: 'Broad search behaviour was found, but no recurring problem theme met the minimum evidence threshold.' });
+
+    stage = 'testing discovered problems with customer evidence';
     const themeResearch = [];
     for (const theme of themes) {
       const q = text(theme.theme);
-      const [reddit, complaints, trends] = await Promise.all([
+      const [reddit, complaints, context] = await Promise.all([
         redditSearch(`"${q}" problem OR issue OR frustrating OR difficult OR recommend OR recommendation OR broken OR "doesn't work"`),
         googleNews(`"${q}" review OR complaint OR frustrating OR difficult OR "doesn't work" OR "wish it"`, 10, 'review/complaint search'),
-        googleNews(`"${q}" trend OR trending OR demand OR popular`, 8, 'supporting trend signal')
+        googleNews(`"${q}" trend OR trending OR demand OR growing OR popular`, 8, 'trend/context signal')
       ]);
-      themeResearch.push({ theme, reddit, complaints, trends });
+      themeResearch.push({ theme, reddit, complaints, context });
     }
 
-    stage = 'calling OpenAI for evidence-led opportunities';
-    const rawSignals = { youtubeThemes: themes, themeResearch, googleTrends: trendItems };
-    const compact = JSON.stringify(rawSignals).slice(0, 75000);
+    stage = 'auditing product opportunities';
+    const rawSignals = { searchQueries, themes, themeResearch, googleTrends: trendItems };
+    const compact = JSON.stringify(rawSignals).slice(0, 90000);
     const prompt = `You are the final commercial product-discovery auditor.
 
-Start with the discovered YouTube themes. Only turn a theme into a potential product opportunity if the supplied evidence demonstrates a SPECIFIC HUMAN PROBLEM that a product could plausibly solve.
-
-A useful result is NOT a recipe, game guide, app tutorial, generic hobby, generic service or broad content trend. It should be a concrete problem such as a person trying to do/fix/remove/protect/organise something where an existing product may be inadequate or an obvious product solution may be missing.
+Start with broad search behaviour and recurring themes. Only turn a theme into a potential product opportunity if the supplied evidence demonstrates a SPECIFIC HUMAN PROBLEM that a product could plausibly solve.
 
 MANDATORY EVIDENCE GATE:
-1. At least 3 related YouTube videos must support the same theme.
-2. There must be at least 1 direct customer discussion from Reddit OR a genuine review/complaint result specifically about the discovered problem. If Reddit/review evidence is absent or only generic, REJECT the opportunity.
+1. The problem must be supported by multiple search-intent/content signals.
+2. There must be at least 1 direct customer discussion from Reddit OR a genuine review/complaint result specifically about the discovered problem. Generic articles do not count as customer evidence.
 3. There must be at least 2 independent evidence types overall.
-4. Never convert a YouTube title into a fabricated customer complaint.
+4. Never convert a query such as "how to X" into a fabricated complaint about X.
 5. Never invent search volume, growth, prices, brands, review counts, sentiment or demand.
-6. Do not call something "trending" unless the supplied data supports that description; otherwise call it a recurring content/search theme.
-7. Reject themes like individual recipes, game walkthroughs and "how to build an app with AI" unless the evidence reveals a separate physical/digital product problem with customer pain.
+6. Only call something "growing" or "trending" if the supplied evidence supports that description. Otherwise say "recurring search-intent theme".
+7. Reject recipes, game walkthroughs, generic education, generic app tutorials and broad hobbies unless a separate concrete product problem is evidenced.
 8. Do not force a result. Returning zero opportunities is correct.
 
-Required chain: YOUTUBE THEME -> SPECIFIC HUMAN PROBLEM -> CUSTOMER EVIDENCE -> EXISTING SOLUTIONS -> UNRESOLVED GAP -> POTENTIAL PRODUCT CONCEPT -> TEST.
+The commercial chain must be: SEARCH INTENT -> RECURRING/GROWING THEME -> SPECIFIC HUMAN PROBLEM -> CUSTOMER EVIDENCE -> EXISTING SOLUTIONS -> UNRESOLVED GAP -> POTENTIAL PRODUCT CONCEPT -> VALIDATION TEST.
+
+Existing solutions must be grounded in supplied evidence. If the sources do not identify products, say so rather than inventing brands.
 
 For every returned opportunity provide exactly: category,title,problem,trend,score,confidence,evidence,products,complaintsEvidence,gap,unproven,audience,ads,sell,next,sources.
 
-Evidence must contain factual observations and exact URLs from supplied data. complaintsEvidence may ONLY use Reddit or review/complaint-search evidence. The product concept should be described in gap/next without pretending demand is proven.
+Evidence must contain factual observations and exact URLs/queries from supplied data. complaintsEvidence may ONLY use Reddit or genuine review/complaint-search evidence. Do not imply demand is proven. The score is an evidence status, not a prediction of sales.
 
 Return ONLY JSON: {"opportunities":[...]}.`;
-    const response = await client.chat.completions.create({ model, temperature: 0, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: 'You are a strict commercial evidence auditor. Reject generic or unsupported ideas. Never fabricate customer voice.' }, { role: 'user', content: `${prompt}\n\nLIVE RESEARCH DATA:\n${compact}` }] });
-    stage = 'processing OpenAI response';
-    const content = response.choices?.[0]?.message?.content; if (!content) throw new Error('OpenAI returned an empty response');
+    const response = await client.chat.completions.create({ model, temperature: 0, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: 'You are a strict commercial evidence auditor. Reject generic or unsupported ideas. Never fabricate customer voice, products or market metrics.' }, { role: 'user', content: `${prompt}\n\nLIVE RESEARCH DATA:\n${compact}` }] });
+    stage = 'processing opportunity evidence';
+    const content = response.choices?.[0]?.message?.content;
+    if (!content) throw new Error('OpenAI returned an empty response');
     const parsed = JSON.parse(content);
     const opportunities = toArray(parsed?.opportunities).map(normalizeOpportunity).filter(x => x.title && x.evidence.length >= 3 && x.complaintsEvidence.length >= 1 && x.sources.length >= 3 && x.score !== 'Needs evidence');
-    return res.status(200).json({ opportunities, scannedAt: new Date().toISOString(), sourceCoverage: { youtube: youtube.length, youtubeEnabled: true, googleTrends: trendItems.length, googleNews: themeResearch.reduce((n, x) => n + x.complaints.length + x.trends.length, 0), reddit: themeResearch.reduce((n, x) => n + x.reddit.length, 0), model }, message: opportunities.length ? undefined : 'Themes were discovered from YouTube, but none passed the customer-evidence and product-problem tests.' });
+
+    return res.status(200).json({
+      opportunities,
+      scannedAt: new Date().toISOString(),
+      sourceCoverage: {
+        searchIntent: searchQueries.length,
+        youtube: youtube.length,
+        youtubeEnabled: true,
+        googleTrends: trendItems.length,
+        googleNews: themeResearch.reduce((n, x) => n + x.complaints.length + x.context.length, 0),
+        reddit: themeResearch.reduce((n, x) => n + x.reddit.length, 0),
+        model
+      },
+      message: opportunities.length ? undefined : 'Search themes were discovered, but none passed the customer-evidence and product-problem tests.'
+    });
   } catch (error) {
-    console.error(`Live scan failed at ${stage}:`, error); const detail = error?.status === 401 ? 'OpenAI rejected the API key.' : error?.status === 429 ? 'OpenAI rate limit or billing limit reached.' : error?.message || 'Unknown error'; return res.status(500).json({ message: `Live scan failed while ${stage}: ${detail}`, stage });
+    console.error(`Live scan failed at ${stage}:`, error);
+    const detail = error?.status === 401 ? 'OpenAI rejected the API key.' : error?.status === 429 ? 'OpenAI rate limit or billing limit reached.' : error?.message || 'Unknown error';
+    return res.status(500).json({ message: `Live scan failed while ${stage}: ${detail}`, stage });
   }
 };
