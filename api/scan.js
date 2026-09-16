@@ -87,11 +87,32 @@ module.exports = async (req, res) => {
     stage = 'calling OpenAI';
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-    const prompt = `You are a commercial product opportunity discovery analyst. Analyse the supplied live public-web signals. Find 8-12 potential product opportunities across Automotive, Home & DIY, Pets and Travel. Start with the human problem, not the product. Do not invent evidence. If a claim is not directly supported by the supplied signals, label it as a hypothesis or say that more evidence is needed. Return ONLY valid JSON with key opportunities containing objects with exactly these keys: category,title,trend,score,evidence,products,gap,audience,ads,sell,next,sources. score must be one of "High potential", "Medium-high", "Medium", "Needs evidence" and is directional only, never a forecast. sources must be an array of up to 4 URLs from the supplied data. ads and sell use " • " separators. Make the reasoning transparent: explain why the signal matters and what is still unproven. Prefer specific consumer problems with an identifiable willingness-to-pay over broad themes. Data: ${compact}`;
+    const prompt = `You are an evidence-led commercial product opportunity discovery analyst. Analyse the supplied live public-web signals and find 8-12 potential product opportunities across Automotive, Home & DIY, Pets and Travel.
+
+IMPORTANT: Do NOT turn a broad trend directly into a generic business idea. The chain must be: SIGNAL -> SPECIFIC HUMAN PROBLEM -> EXISTING PRODUCTS -> VERIFIED/OBSERVED CUSTOMER COMPLAINTS OR GAP -> POTENTIAL PRODUCT OPPORTUNITY -> TEST.
+
+Rules:
+- Start each opportunity with a specific human problem, not a product category.
+- Only state a demand signal when the supplied data supports it. Name the signal/source in evidence.
+- Never invent search volumes, growth percentages, product names, prices, review counts, customer complaints or market facts.
+- Existing products should be actual products/product types supported by the supplied evidence where possible. If the supplied data is insufficient, say so rather than inventing brands.
+- Customer gaps must be evidence-backed. If complaints/gaps are NOT present in the supplied data, set complaintsEvidence to an empty array and say "More product-review/comment evidence needed" in gap and unproven.
+- Separate observed evidence from AI interpretation. Do not present interpretation as fact.
+- A potential opportunity is not guaranteed demand.
+- Do not use the old generic claim "limited options" unless the supplied evidence actually demonstrates it.
+- Prefer narrow, high-intent consumer problems with an identifiable reason someone might pay to solve them.
+- Score is directional, based ONLY on strength and breadth of supplied evidence, not a prediction. Use one of "High potential", "Medium-high", "Medium", "Needs evidence".
+- confidence is an integer from 1-10 representing confidence in the evidence supporting the opportunity, NOT likelihood of success.
+- evidence should be an array of 2-5 short factual observations. Each observation must have source and detail fields.
+- complaintsEvidence should be an array of 0-4 short factual observations, each with source and detail. Never fabricate these.
+- sources should contain up to 4 exact URLs from supplied data only.
+- Return ONLY valid JSON with key opportunities. Each opportunity must have exactly these keys: category,title,problem,trend,score,confidence,evidence,products,complaintsEvidence,gap,unproven,audience,ads,sell,next,sources.
+
+Data: ${compact}`;
 
     const response = await client.chat.completions.create({
       model,
-      temperature: 0.2,
+      temperature: 0.1,
       response_format: { type: 'json_object' },
       messages: [
         { role: 'system', content: 'Return evidence-led structured commercial research. Never fabricate sources, prices, demand or customer complaints.' },
