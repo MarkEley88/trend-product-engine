@@ -1,14 +1,7 @@
 const OpenAI = require('openai');
 
-const categories = [
-  { category: 'Automotive', queries: ['car interior plastic restoration', 'car detailing mistakes damage', 'car scratch repair DIY', 'car cleaning difficult problems'] },
-  { category: 'Home & DIY', queries: ['kitchen storage clutter appliances', 'small kitchen storage problems', 'home organisation storage problems', 'under sink storage problems'] },
-  { category: 'Pets', queries: ['dog nail trimming difficult', 'dog grooming at home problems', 'dog hair cleaning difficult', 'pet grooming tool problems'] },
-  { category: 'Travel', queries: ['family travel packing problems', 'travelling with kids airport problems', 'family travel organisation problems', 'airplane travel with kids difficult'] }
-];
-
 function clean(value = '') { return String(value).replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim(); }
-function rssItems(xml, limit = 12) {
+function rssItems(xml, limit = 25) {
   const items = []; const matches = xml.match(/<item[\s\S]*?<\/item>/gi) || [];
   for (const block of matches.slice(0, limit)) {
     const title = clean((block.match(/<title>([\s\S]*?)<\/title>/i) || [,''])[1]);
@@ -18,23 +11,23 @@ function rssItems(xml, limit = 12) {
   }
   return items;
 }
-async function fetchText(url) { const response = await fetch(url, { headers: { 'User-Agent': 'TrendProductEngine/0.4' } }); if (!response.ok) throw new Error(`Source returned ${response.status}`); return response.text(); }
-async function googleNews(query, limit = 8, signalType = 'discovery') {
-  try { const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-GB&gl=GB&ceid=GB:en`; return rssItems(await fetchText(url), limit).map(x => ({ ...x, source: 'Google News', signalType })); }
-  catch (e) { console.error('Google News failed:', e.message); return []; }
-}
+async function fetchText(url, headers = {}) { const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TrendProductEngine/1.0)', ...headers } }); if (!response.ok) throw new Error(`Source returned ${response.status}`); return response.text(); }
 async function googleTrends() {
   try { return rssItems(await fetchText('https://trends.google.com/trending/rss?geo=GB'), 25).map(x => ({ ...x, source: 'Google Trends', signalType: 'trending search' })); }
   catch (e) { console.error('Google Trends failed:', e.message); return []; }
 }
+async function googleNews(query, limit = 10, signalType = 'context') {
+  try { const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-GB&gl=GB&ceid=GB:en`; return rssItems(await fetchText(url), limit).map(x => ({ ...x, source: 'Google News', signalType })); }
+  catch (e) { console.error('Google News failed:', e.message); return []; }
+}
 async function redditSearch(query) {
   const urls = [
-    `https://www.reddit.com/search.json?q=${encodeURIComponent(query)}&sort=new&limit=8`,
-    `https://old.reddit.com/search.json?q=${encodeURIComponent(query)}&sort=new&limit=8`
+    `https://www.reddit.com/search.json?q=${encodeURIComponent(query)}&sort=new&limit=10`,
+    `https://old.reddit.com/search.json?q=${encodeURIComponent(query)}&sort=new&limit=10`
   ];
   for (const url of urls) {
     try {
-      const response = await fetch(url, { headers: { 'User-Agent': 'TrendProductEngine/0.4 research bot' } });
+      const response = await fetch(url, { headers: { 'User-Agent': 'TrendProductEngine/1.0 research bot' } });
       if (!response.ok) continue;
       const data = await response.json();
       return (data?.data?.children || []).map(x => ({ title: x?.data?.title || '', link: x?.data?.permalink ? `https://www.reddit.com${x.data.permalink}` : '', pubDate: x?.data?.created_utc ? new Date(x.data.created_utc * 1000).toISOString() : '', source: 'Reddit', signalType: 'customer discussion' })).filter(x => x.title);
@@ -42,13 +35,38 @@ async function redditSearch(query) {
   }
   return [];
 }
-async function youtubeSearch(query) {
-  if (!process.env.YOUTUBE_API_KEY) return [];
+
+// YouTube's public search page is used for discovery so the prototype does not require a paid data provider.
+// OpenAI then interprets the actual returned video titles/metadata; the app does not invent search themes.
+async function youtubeWebSearch() {
   try {
-    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&order=relevance&maxResults=10&q=${encodeURIComponent(query)}&regionCode=GB&relevanceLanguage=en&key=${encodeURIComponent(process.env.YOUTUBE_API_KEY)}`;
-    const response = await fetch(url); if (!response.ok) throw new Error(`YouTube returned ${response.status}`); const data = await response.json();
-    return (data.items || []).map(item => ({ title: item.snippet?.title || '', link: item.id?.videoId ? `https://www.youtube.com/watch?v=${item.id.videoId}` : '', publishedAt: item.snippet?.publishedAt || '', channel: item.snippet?.channelTitle || '', source: 'YouTube', signalType: 'video content' }));
-  } catch (e) { console.error('YouTube failed:', e.message); return []; }
+    const url = 'https://www.youtube.com/results?search_query=how%20to';
+    const html = await fetchText(url, { 'Accept-Language': 'en-GB,en;q=0.9' });
+    const marker = 'var ytInitialData = ';
+    const start = html.indexOf(marker);
+    if (start < 0) throw new Error('YouTube search data was not found');
+    const jsonStart = start + marker.length;
+    const end = html.indexOf(';var ytInitialPlayerResponse', jsonStart);
+    const raw = end > jsonStart ? html.slice(jsonStart, end) : html.slice(jsonStart, html.indexOf('</script>', jsonStart));
+    const data = JSON.parse(raw.trim().replace(/;$/, ''));
+    const results = [];
+    function walk(node) {
+      if (!node || results.length >= 50) return;
+      if (Array.isArray(node)) { for (const item of node) walk(item); return; }
+      if (typeof node !== 'object') return;
+      const renderer = node.videoRenderer;
+      if (renderer?.videoId && renderer?.title?.runs?.length) {
+        const title = renderer.title.runs.map(r => r.text || '').join('').trim();
+        const channel = renderer.ownerText?.runs?.map(r => r.text || '').join('').trim() || '';
+        const published = renderer.publishedTimeText?.simpleText || '';
+        const views = renderer.viewCountText?.simpleText || '';
+        if (title) results.push({ title, link: `https://www.youtube.com/watch?v=${renderer.videoId}`, channel, published, views, source: 'YouTube', signalType: 'YouTube search result' });
+      }
+      for (const value of Object.values(node)) walk(value);
+    }
+    walk(data);
+    return results;
+  } catch (e) { console.error('YouTube web search failed:', e.message); return []; }
 }
 function toArray(value) { if (Array.isArray(value)) return value; if (value == null || value === '') return []; return [value]; }
 function text(value, fallback = '') { if (typeof value === 'string') return value.trim() || fallback; if (typeof value === 'number') return String(value); if (typeof value === 'boolean') return value ? 'Yes' : 'No'; if (value && typeof value === 'object') { if (typeof value.detail === 'string') return value.detail; if (typeof value.text === 'string') return value.text; return JSON.stringify(value); } return fallback; }
@@ -57,68 +75,66 @@ function normalizeSources(value) { return toArray(value).map(item => typeof item
 function normalizeOpportunity(item, index) {
   const allowedScores = new Set(['High potential', 'Medium-high', 'Medium', 'Needs evidence']);
   const evidence = normalizeEvidence(item?.evidence), complaints = normalizeEvidence(item?.complaintsEvidence);
-  return { category: text(item?.category, 'Uncategorised'), title: text(item?.title, `Potential opportunity ${index + 1}`), problem: text(item?.problem, 'A specific human problem needs further definition.'), trend: text(item?.trend, 'Signal identified in the supplied research.'), score: allowedScores.has(item?.score) ? item.score : 'Needs evidence', confidence: Math.max(1, Math.min(10, Number.parseInt(item?.confidence, 10) || 1)), evidence: evidence.slice(0, 6), products: text(item?.products, 'No sufficiently specific existing solutions identified.'), complaintsEvidence: complaints.slice(0, 5), gap: text(item?.gap, 'No verified product gap yet; collect more customer evidence.'), unproven: text(item?.unproven, 'The strongest unresolved complaint, willingness to pay and product gap still need validation.'), audience: text(item?.audience, 'Audience needs further investigation.'), ads: text(item?.ads, 'Advertising channels need further investigation.'), sell: text(item?.sell, 'Sales channels need further investigation.'), next: text(item?.next, 'Collect more product-review and customer-discussion evidence before making a product decision.'), sources: normalizeSources(item?.sources) };
+  return { category: text(item?.category, 'Emerging theme'), title: text(item?.title, `Potential opportunity ${index + 1}`), problem: text(item?.problem, 'A specific human problem needs further definition.'), trend: text(item?.trend, 'Theme identified from current source signals.'), score: allowedScores.has(item?.score) ? item.score : 'Needs evidence', confidence: Math.max(1, Math.min(10, Number.parseInt(item?.confidence, 10) || 1)), evidence: evidence.slice(0, 6), products: text(item?.products, 'No sufficiently specific existing solutions identified.'), complaintsEvidence: complaints.slice(0, 5), gap: text(item?.gap, 'No verified product gap yet; collect more customer evidence.'), unproven: text(item?.unproven, 'The strongest unresolved complaint, willingness to pay and product gap still need validation.'), audience: text(item?.audience, 'Audience needs further investigation.'), ads: text(item?.ads, 'Advertising channels need further investigation.'), sell: text(item?.sell, 'Sales channels need further investigation.'), next: text(item?.next, 'Collect more product-review and customer-discussion evidence before making a product decision.'), sources: normalizeSources(item?.sources) };
 }
 module.exports = async (req, res) => {
   if (req.method !== 'GET') return res.status(405).json({ message: 'GET only' });
   if (!process.env.OPENAI_API_KEY) return res.status(200).json({ message: 'OPENAI_API_KEY is not available to this deployment. Add it to the Production environment and redeploy.', opportunities: [], sources: [] });
   let stage = 'starting';
   try {
-    stage = 'collecting Google Trends'; const trendItems = await googleTrends(); const sourceResults = [];
-    stage = 'collecting problem, review and customer-discussion signals';
-    for (const group of categories) for (const query of group.queries) {
-      const [discovery, complaintSearch, reddit, youtube] = await Promise.all([
-        googleNews(`"${query}" how to OR problem OR fix OR difficult`, 8, 'discovery'),
-        googleNews(`"${query}" review OR reviews OR complaint OR complaints OR "doesn't work" OR annoying OR "wish"`, 8, 'review/complaint search'),
-        redditSearch(`${query} problem OR issue OR recommendation OR review`),
-        youtubeSearch(query)
-      ]);
-      sourceResults.push({ category: group.category, query, discovery, complaintSearch, reddit, youtube });
-    }
-    const rawSignals = { googleTrends: trendItems, categoryResearch: sourceResults };
-    const compact = JSON.stringify(rawSignals).slice(0, 60000);
-    stage = 'calling OpenAI'; const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY }); const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-    const prompt = `You are the research engine for a commercial product discovery platform. Your job is to discover SPECIFIC, evidence-backed human problems that may reveal product opportunities.
+    stage = 'discovering YouTube how-to themes';
+    const [youtube, trendItems] = await Promise.all([youtubeWebSearch(), googleTrends()]);
+    stage = 'collecting supporting discussion and review signals';
+    const reddit = await redditSearch('"how to" problem OR issue OR recommendation OR review');
+    const contextNews = await googleNews('"how to" problem OR fix OR difficult OR review', 20, 'supporting context');
+    const rawSignals = { youtube, googleTrends: trendItems, reddit, contextNews };
+    const compact = JSON.stringify(rawSignals).slice(0, 70000);
+    stage = 'calling OpenAI';
+    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+    const prompt = `You are the discovery and commercial research engine for a product opportunity platform.
 
-Do NOT return broad topics or generic business ideas. "dog grooming", "home organisation", "family travel" and "car detailing" are research areas, NOT opportunities.
+The user does NOT want predefined categories or searches. The engine has gone directly to YouTube and asked the market through a broad "how to" search. Your job is to analyse the ACTUAL returned YouTube results and discover the themes that are emerging from them.
 
-A useful result looks like: a clearly defined person + situation + recurring pain + evidence that the pain exists + existing solution/product context + an unresolved need that could plausibly be improved by a physical/digital product.
+Do not start from Automotive, Home, Pets or Travel. Those old categories are gone from discovery. A theme may come from any subject.
 
-Required chain: TREND/SIGNAL -> SPECIFIC HUMAN PROBLEM -> EXISTING SOLUTIONS -> CUSTOMER VOICE / COMPLAINT -> UNRESOLVED NEED -> POTENTIAL PRODUCT CONCEPT -> TEST.
+FIRST: cluster the supplied YouTube results into specific recurring themes. Prefer themes where multiple videos independently point to the same task, problem, frustration or desired outcome. Do not simply repeat one video title.
 
-CRITICAL EVIDENCE RULES:
-- Do not manufacture specificity from a generic article.
-- Every opportunity needs 2+ independent evidence observations.
-- At least one observation must be from a customer-discussion or review/complaint signal. Google News articles that merely report an expert warning or general trend are NOT customer voice.
-- Reddit items are direct customer discussion signals. Items from the complaintSearch stream are review/complaint SEARCH signals and may be used, but describe them honestly as such.
-- Do not claim a product is defective, unsafe, popular, profitable or poorly reviewed unless the supplied evidence actually says that.
-- Never invent search volumes, growth rates, prices, brands, review counts, market sizes or customer sentiment.
-- Existing products should be named only if the supplied data names them; otherwise describe the solution type.
-- If the evidence only supports a broad theme, REJECT it.
-- Do not force one result per category. It is fine to return 0, 1, 2 or many from one category and none from another.
-- Avoid generic titles such as "Dog Grooming Safety Kits", "Compact Kitchen Storage Solutions", "Car Detailing Kits for Busy Parents" or "Rising Costs of Family Travel" unless the supplied evidence identifies a materially more specific recurring problem.
+SECOND: turn the strongest themes into specific human problems. A useful result looks like: clearly defined person + situation + recurring pain + evidence + existing solution/product context + unresolved need that a product could plausibly improve.
+
+THIRD: use Reddit, Google Trends and Google News only as supporting evidence. Reddit is customer discussion. Google Trends is a search-demand signal. Google News is context/discovery evidence, NOT customer voice.
+
+FOURTH: only return a potential product opportunity where the evidence is sufficiently specific. If a theme is interesting but there is not enough evidence of a concrete problem or customer gap, reject it rather than filling the list.
+
+Required chain: YOUTUBE TREND/THEME -> SPECIFIC HUMAN PROBLEM -> EXISTING SOLUTIONS -> CUSTOMER VOICE / COMPLAINT -> UNRESOLVED NEED -> POTENTIAL PRODUCT CONCEPT -> TEST.
+
+CRITICAL RULES:
+- Do not invent search volume, growth rates, prices, brands, review counts, market sizes, sentiment or demand.
+- Do not call something "trending" merely because one video exists. Explain the evidence actually supplied.
+- YouTube search results are signals of content/search interest, not proof of sales demand.
+- Every opportunity needs at least 2 independent evidence observations.
+- At least one must be a customer discussion or review/complaint signal from Reddit or the supplied review/context stream. If no credible customer voice exists, reject the opportunity.
+- Do not manufacture a complaint from a video title.
+- Existing products should only be named if supplied evidence names them.
+- Do not force a result from every theme or category.
+- Avoid generic ideas. The output should be specific enough that someone could investigate or source a product against the exact problem.
 - A potential opportunity is not guaranteed demand.
 - confidence measures evidence strength, not commercial success probability.
 
-For every opportunity:
-- title: specific problem/opportunity, ideally naming the task and pain point.
-- problem: who is struggling, in what situation, and what goes wrong.
-- trend: explain the discovery signal without exaggeration.
-- evidence: 2-6 factual observations from supplied items. Each item MUST include source, detail and URL when available.
-- complaintsEvidence: 1-5 observations specifically from Reddit or the review/complaint search stream. Each item MUST include source, detail and URL when available. If there is no credible customer voice, reject the opportunity.
-- products: only existing solution/product types supported by evidence.
-- gap: describe the specific unresolved need evidenced by the sources. Do not simply say "safer" or "better" without explaining what is missing.
-- unproven: clearly state the biggest remaining commercial unknown.
-- audience/ads/sell: only make claims supported by the research; otherwise say more evidence is needed.
-- sources: exact URLs from supplied data only.
+For every opportunity return exactly:
+category,title,problem,trend,score,confidence,evidence,products,complaintsEvidence,gap,unproven,audience,ads,sell,next,sources.
 
-Return ONLY JSON: {"opportunities":[...]}. Each object must have exactly category,title,problem,trend,score,confidence,evidence,products,complaintsEvidence,gap,unproven,audience,ads,sell,next,sources.
+Evidence items must contain source, detail and URL when available. complaintsEvidence must contain only direct Reddit/customer discussion or review/complaint evidence. sources must contain exact URLs from supplied data only.
 
-DATA:\n${compact}`;
-    const response = await client.chat.completions.create({ model, temperature: 0.05, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: 'You are a strict evidence auditor. Never fabricate evidence. Reject generic opportunities.' }, { role: 'user', content: prompt }] });
-    stage = 'processing OpenAI response'; const content = response.choices?.[0]?.message?.content; if (!content) throw new Error('OpenAI returned an empty response');
-    const parsed = JSON.parse(content); const opportunities = toArray(parsed?.opportunities).map(normalizeOpportunity).filter(x => x.title && x.evidence.length >= 2 && x.complaintsEvidence.length >= 1 && x.sources.length >= 2);
-    return res.status(200).json({ opportunities, scannedAt: new Date().toISOString(), sourceCoverage: { googleTrends: trendItems.length, googleNews: sourceResults.reduce((n, x) => n + x.discovery.length + x.complaintSearch.length, 0), reddit: sourceResults.reduce((n, x) => n + x.reddit.length, 0), youtube: sourceResults.reduce((n, x) => n + x.youtube.length, 0), youtubeEnabled: Boolean(process.env.YOUTUBE_API_KEY), model }, message: opportunities.length ? undefined : 'Signals were found, but the evidence did not meet the specificity threshold for a product opportunity.' });
+Return ONLY JSON: {"opportunities":[...]}
+
+SUPPLIED LIVE DATA:\n${compact}`;
+    const response = await client.chat.completions.create({ model, temperature: 0.05, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: 'You are a strict evidence auditor and trend researcher. Discover themes from supplied source data. Never fabricate evidence.' }, { role: 'user', content: prompt }] });
+    stage = 'processing OpenAI response';
+    const content = response.choices?.[0]?.message?.content; if (!content) throw new Error('OpenAI returned an empty response');
+    const parsed = JSON.parse(content);
+    const opportunities = toArray(parsed?.opportunities).map(normalizeOpportunity).filter(x => x.title && x.evidence.length >= 2 && x.complaintsEvidence.length >= 1 && x.sources.length >= 2);
+    return res.status(200).json({ opportunities, scannedAt: new Date().toISOString(), sourceCoverage: { youtube: youtube.length, youtubeEnabled: true, googleTrends: trendItems.length, googleNews: contextNews.length, reddit: reddit.length, model }, message: opportunities.length ? undefined : 'YouTube themes were found, but the evidence did not meet the specificity threshold for a product opportunity.' });
   } catch (error) {
     console.error(`Live scan failed at ${stage}:`, error); const detail = error?.status === 401 ? 'OpenAI rejected the API key.' : error?.status === 429 ? 'OpenAI rate limit or billing limit reached.' : error?.message || 'Unknown error'; return res.status(500).json({ message: `Live scan failed while ${stage}: ${detail}`, stage });
   }
